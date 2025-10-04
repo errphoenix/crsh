@@ -377,15 +377,9 @@ impl MasterEndpoint {
         }
     }
 
-    pub async fn query(&self, request: HistoryQuery) -> Result<HistoryQuery, EndpointError> {
+    pub async fn query(&self) -> Result<HistoryQuery, EndpointError> {
         self.0.ping().await?;
-        match self
-            .1
-            .get(self.0.as_out_query_url())
-            .json(&request)
-            .send()
-            .await
-        {
+        match self.1.get(self.0.as_out_query_url()).send().await {
             Ok(res) => Ok(res
                 .json::<HistoryQuery>()
                 .await
