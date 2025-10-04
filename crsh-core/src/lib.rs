@@ -188,7 +188,7 @@ impl From<Remote> for Url {
     }
 }
 
-pub const HISTORY_LENGTH: usize = 1024;
+pub const HISTORY_LENGTH: usize = 340;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryLn {
@@ -286,7 +286,7 @@ impl MasterRouter {
         self.queue.contains_key(token)
     }
 
-    const HISTORY_EVICT_ITER: usize = 128;
+    const HISTORY_EVICT_ITER: usize = 72;
 
     pub fn append_history(&mut self, hist: Vec<HistoryLn>) {
         let len = hist.len();

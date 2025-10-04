@@ -232,10 +232,7 @@ fn print_help() -> Result<(), Box<dyn Error>> {
     writeln!(lock, "   [--target TOKEN] COMMAND...")?;
     writeln!(lock)?;
     writeln!(lock, "   query Query CRSH router out + err history")?;
-    writeln!(
-        lock,
-        "   [-N {DEFAULT_QUERY_COUNT} [1,1024]] [ADDRESS:PORT]"
-    )?;
+    writeln!(lock, "   [-N {DEFAULT_QUERY_COUNT} [1,340]] [ADDRESS:PORT]")?;
 
     writeln!(lock)?;
     writeln!(lock, "MISCELLANEOUS")?;
