@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+.idea
+token
+./crsh-server/active
+./crsh-server/key

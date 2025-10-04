@@ -1,0 +1,9 @@
+[package]
+name = "crsh-tx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crsh-core = { path = "../crsh-core" }
+reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros"] }

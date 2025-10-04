@@ -1,0 +1,10 @@
+[package]
+name = "crsh"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+crsh-core = { path = "crsh-core" }
+rand = "0.10.0-rc.0"
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros"] }

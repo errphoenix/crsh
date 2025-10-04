@@ -1,0 +1,15 @@
+[package]
+name = "crsh-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[profile.release]
+lto = true
+strip = true
+
+[dependencies]
+tokio = { version = "1.47.1", default-features = false, features = ["macros", "rt-multi-thread"] }
+crsh-core = { path = "../crsh-core" }
+axum = "0.8.6"
+
