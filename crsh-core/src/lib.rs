@@ -95,7 +95,14 @@ impl FromStr for Remote {
         if !s.contains(":") || addrp.is_none() {
             return Err(RemoteAddrParseError::BadFormatting);
         }
+
         let (address, port_str) = addrp.unwrap();
+        let port_str = if port_str.ends_with("/") {
+            port_str.trim_end_matches("/")
+        } else {
+            port_str
+        };
+
         if address.is_empty() {
             return Err(RemoteAddrParseError::InvalidAddr);
         }
@@ -349,6 +356,16 @@ pub enum EndpointError {
 impl From<ConnectError> for EndpointError {
     fn from(value: ConnectError) -> Self {
         Self::ConnFailure { e: value }
+    }
+}
+
+impl Display for EndpointError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EndpointError::ConnFailure { e } => write!(f, "{e}"),
+            EndpointError::SubmitFailure(r) => write!(f, "{r}"),
+            EndpointError::QueryFailure(r) => write!(f, "{r}"),
+        }
     }
 }
 
