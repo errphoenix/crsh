@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{stdout, Write};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use tower_http::cors::{Any, CorsLayer};
 
 const VER_STR: &str = "v0.1.0-router";
 
@@ -102,6 +103,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         writeln!(lock, "Initialising router server...")?;
     }
 
+    let cors = CorsLayer::new().allow_origin(Any);
     let app = Router::new()
         .route("/", get(root))
         .route(crsh_core::ROUTER_AUTH, post(hello))
@@ -109,7 +111,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .route(crsh_core::ROUTER_SUBMIT, post(submit))
         .route(crsh_core::ROUTER_OUT, post(push_out))
         .route(crsh_core::ROUTER_QUERY_OUT, get(query_out))
-        .with_state(Arc::new(Mutex::new(handler)));
+        .with_state(Arc::new(Mutex::new(handler)))
+        .layer(cors);
 
     println!("KEY: {key}");
     {
