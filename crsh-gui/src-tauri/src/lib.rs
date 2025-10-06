@@ -7,8 +7,13 @@ use tauri::State;
 #[tauri::command]
 async fn set_remote(state: State<'_, Mutex<AppState>>, remote: &str) -> Result<(), String> {
     let mut state = state.lock().await;
+    let addr = if remote.starts_with("http") {
+        remote.to_string()
+    } else {
+        format!("http://{remote}")
+    };
     state.remote = Some(MasterEndpoint::new(
-        Remote::from_str(remote).map_err(|e| e.to_string())?,
+        Remote::from_str(addr.as_str()).map_err(|e| e.to_string())?,
     ));
     Ok(())
 }
