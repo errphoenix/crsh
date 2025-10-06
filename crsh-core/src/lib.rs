@@ -4,18 +4,19 @@ pub use net::*;
 use rand::random;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
 use std::num::ParseIntError;
 use std::ops::Deref;
 use std::str::FromStr;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tokio::time::sleep_until;
+use tokio::time::{sleep_until, Instant};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -588,44 +589,56 @@ pub struct ServingClient {
     pub interval: Duration,
     pub name: &'static str,
 
-    rx: Option<mpsc::Receiver<Command>>,
-    recv_thread: Option<JoinHandle<()>>,
+    master: Arc<RwLock<Agent<Connected>>>,
+    token: String,
 
-    /// Takes care of synchronising client with master.
-    /// Polling commands & pushing outputs.
-    sync_thread: JoinHandle<()>,
-    out_tx: mpsc::Sender<Vec<HistoryLn>>,
+    handle: ClientSyncHandle,
 }
 
-const DEFAULT_INTERVAL_MS: u64 = 1500;
+const DEFAULT_INTERVAL_MS: u64 = 500;
+
+/// Takes care of synchronising client with master.
+/// Polling commands & pushing outputs.
+struct ClientSyncHandle {
+    cmd_rx: Option<Receiver<Command>>,
+    out_tx: Sender<Vec<HistoryLn>>,
+    sync_thread: JoinHandle<()>,
+    push_thread: JoinHandle<()>,
+    recv_thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for ClientSyncHandle {
+    fn drop(&mut self) {
+        if let Some(recv_thread) = &self.recv_thread {
+            recv_thread.abort()
+        }
+        self.sync_thread.abort();
+        self.push_thread.abort();
+        println!("Killed all synchronisation threads.");
+    }
+}
 
 impl Drop for ServingClient {
     fn drop(&mut self) {
-        self.kill_recv();
-        self.sync_thread.abort();
     }
 }
 
 impl ServingClient {
-    pub fn new(
+    fn init_sync_thread(
         master: Arc<RwLock<Agent<Connected>>>,
         token: String,
-        interval: Option<Duration>,
-        name: &'static str,
-    ) -> Self {
-        let interval = interval.unwrap_or_else(|| Duration::from_millis(DEFAULT_INTERVAL_MS));
-        let (tx, rx) = mpsc::channel::<Command>();
+        interval: Duration,
+    ) -> ClientSyncHandle {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
         let (out_tx, out_rx) = mpsc::channel::<Vec<HistoryLn>>();
 
         let sync_thread = {
+            let master = master.clone();
+            let token = token.clone();
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let mut last = Instant::now();
                 loop {
-                    if last.elapsed() <= interval {
-                        continue;
-                    }
-
+                    sleep_until(Instant::now() + interval).await;
                     match master
                         .read()
                         .await
@@ -637,7 +650,7 @@ impl ServingClient {
                         PollResult::Success { queue } => {
                             queue
                                 .iter()
-                                .for_each(|c| tx.send(Command::from_str(c).unwrap()).unwrap());
+                                .for_each(|c| cmd_tx.send(Command::from_str(c).unwrap()).unwrap());
                         }
                         PollResult::Failure { reason } => {
                             let _ = out_tx.send(vec![HistoryLn::new_stderr(format!(
@@ -647,7 +660,13 @@ impl ServingClient {
                         }
                         PollResult::EmptyQueue => {}
                     }
-
+                }
+            })
+        };
+        let push_thread = {
+            tokio::spawn(async move {
+                loop {
+                    sleep_until(Instant::now() + interval).await;
                     if let Ok(mut msg) = out_rx.try_recv()
                         && !msg.is_empty()
                     {
@@ -660,8 +679,47 @@ impl ServingClient {
                             })
                             .await;
                     }
+                }
+            })
+        };
 
-                    last = Instant::now();
+        ClientSyncHandle {
+            cmd_rx: Some(cmd_rx),
+            out_tx,
+            sync_thread,
+            push_thread,
+            recv_thread: None,
+        }
+    }
+
+    pub fn new(
+        master: Arc<RwLock<Agent<Connected>>>,
+        token: String,
+        interval: Option<Duration>,
+        name: &'static str,
+    ) -> Self {
+        let interval = interval.unwrap_or_else(|| Duration::from_millis(DEFAULT_INTERVAL_MS));
+        let handle = Self::init_sync_thread(master.clone(), token.clone(), interval);
+        let must_reset = Arc::new(Mutex::new(false));
+
+        let reset_handle = {
+            let must_reset = must_reset.clone();
+            let master = master.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                let interval = Duration::from_millis(RESET_QUERY_INTERVAL_MS);
+                loop {
+                    sleep_until(Instant::now() + interval).await;
+                    if master
+                        .read()
+                        .await
+                        .needs_reset(PollRequest {
+                            token: token.clone(),
+                        })
+                        .await
+                    {
+                        *must_reset.lock().unwrap() = true;
+                    }
                 }
             })
         };
@@ -669,30 +727,39 @@ impl ServingClient {
         Self {
             interval,
             name,
+            master,
+            token,
 
-            rx: Some(rx),
-            recv_thread: None,
-
-            sync_thread,
-            out_tx,
+            handle,
+            reset_handle,
+            must_reset,
         }
     }
 
     pub fn recv_handle(&mut self) -> &mut Option<JoinHandle<()>> {
-        &mut self.recv_thread
+        &mut self.handle.recv_thread
     }
 
-    pub fn run_recv(&mut self) {
-        let rx = self.rx.take();
+    pub fn sync_handle(&mut self) -> &mut JoinHandle<()> {
+        &mut self.handle.sync_thread
+    }
+
+    pub async fn run_recv(&mut self) {
+        let rx = self.handle.cmd_rx.take();
         if rx.is_none() {
-            eprintln!("Failed to start recv thread: it has been eaten.");
-            return;
+            eprintln!("Broken RX state. Resetting synchronisation handle...");
+            self.reset().await;
         }
-        let out_tx = self.out_tx.clone();
-        self.recv_thread = Some(tokio::spawn(async move {
-            let rx = rx.unwrap();
+        let rx = rx.unwrap();
+        let out_tx = self.handle.out_tx.clone();
+        let master = self.master.clone();
+        let token = self.token.clone();
+        let interval = self.interval;
+        println!("Initialising recv thread...");
+        self.handle.recv_thread = Some(tokio::spawn(async move {
             loop {
-                match rx.recv() {
+                sleep_until(Instant::now() + interval).await;
+                match rx.try_recv() {
                     Ok(msg) => {
                         let mut w: Vec<&str> = msg.0.split_whitespace().collect();
                         let out = std::process::Command::new(w[0])
