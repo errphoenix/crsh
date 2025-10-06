@@ -59,3 +59,8 @@ pub struct PushRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryQuery(pub Vec<HistoryLn>);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResetRequest {
+    pub token: String,
+}

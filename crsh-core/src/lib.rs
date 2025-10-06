@@ -128,6 +128,8 @@ pub type PingResult = Result<u32, ConnectError>;
 pub const ROUTER_AUTH: &str = "/hello";
 pub const ROUTER_END: &str = "/bye";
 pub const ROUTER_POLL: &str = "/poll";
+pub const ROUTER_SET_RESET: &str = "/reset";
+pub const ROUTER_ASK_RESET: &str = "/amiok";
 pub const ROUTER_OUT: &str = "/out";
 pub const ROUTER_QUERY_OUT: &str = "/outq";
 pub const ROUTER_SUBMIT: &str = "/cmd";
@@ -163,6 +165,14 @@ impl Remote {
 
     fn as_poll_url(&self) -> String {
         format!("{self}{}", ROUTER_POLL)
+    }
+
+    fn as_set_reset_url(&self) -> String {
+        format!("{self}{}", ROUTER_SET_RESET)
+    }
+
+    fn as_ask_reset_url(&self) -> String {
+        format!("{self}{}", ROUTER_ASK_RESET)
     }
 
     fn as_out_url(&self) -> String {
@@ -247,6 +257,7 @@ impl Display for OutType {
 pub struct MasterRouter {
     history: VecDeque<HistoryLn>,
     queue: HashMap<String, Arc<Mutex<Vec<Command>>>>,
+    reset: HashSet<String>,
 }
 
 const COMMAND_BUFFER_ALLOC: usize = 8;
@@ -257,9 +268,18 @@ impl MasterRouter {
             Self {
                 history: VecDeque::with_capacity(HISTORY_LENGTH),
                 queue: HashMap::new(),
+                reset: HashSet::new(),
             },
             key.unwrap_or_else(random::<u16>),
         )
+    }
+
+    pub fn set_reset(&mut self, token: String) {
+        self.reset.insert(token);
+    }
+
+    pub fn must_reset(&mut self, token: &str) -> bool {
+        self.reset.remove(token)
     }
 
     pub fn register_all(&mut self, tokens: &[String]) {
@@ -352,6 +372,7 @@ pub enum EndpointError {
     ConnFailure { e: ConnectError },
     SubmitFailure(String),
     QueryFailure(String),
+    ResetFailure(String),
 }
 
 impl From<ConnectError> for EndpointError {
@@ -364,8 +385,9 @@ impl Display for EndpointError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             EndpointError::ConnFailure { e } => write!(f, "{e}"),
-            EndpointError::SubmitFailure(r) => write!(f, "{r}"),
-            EndpointError::QueryFailure(r) => write!(f, "{r}"),
+            EndpointError::SubmitFailure(r) => write!(f, "submit failure: {r}"),
+            EndpointError::QueryFailure(r) => write!(f, "query: failure: {r}"),
+            EndpointError::ResetFailure(r) => write!(f, "reset failure: {r}"),
         }
     }
 }
@@ -403,6 +425,24 @@ impl MasterEndpoint {
                 .await
                 .map_err(|e| EndpointError::QueryFailure(e.to_string()))?),
             Err(e) => Err(EndpointError::QueryFailure(e.to_string())),
+        }
+    }
+
+    pub async fn reset(&self, token: &str) -> Result<(), EndpointError> {
+        self.0.ping().await?;
+        let req = PollRequest {
+            token: token.to_string(),
+        };
+        if let Err(e) = self
+            .1
+            .post(self.0.as_set_reset_url())
+            .json(&req)
+            .send()
+            .await
+        {
+            Err(EndpointError::ResetFailure(e.to_string()))
+        } else {
+            Ok(())
         }
     }
 }
@@ -524,6 +564,22 @@ impl Agent<PreConnect> {
 }
 
 impl Agent<Connected> {
+    pub async fn needs_reset(&self, request: PollRequest) -> bool {
+        let client = self.client.as_ref().unwrap();
+        let resp_body = client
+            .get::<String>(self.remote.as_ask_reset_url())
+            .json(&request)
+            .send()
+            .await;
+        if let Ok(resp) = resp_body
+            && let Ok(plain) = resp.text().await
+        {
+            bool::from_str(&plain).unwrap_or_default()
+        } else {
+            false
+        }
+    }
+
     pub async fn poll(&self, request: PollRequest) -> PollResult {
         let client = self.client.as_ref().unwrap();
         let resp_body = client
@@ -593,9 +649,12 @@ pub struct ServingClient {
     token: String,
 
     handle: ClientSyncHandle,
+    reset_handle: JoinHandle<()>,
+    must_reset: Arc<Mutex<bool>>,
 }
 
 const DEFAULT_INTERVAL_MS: u64 = 500;
+const RESET_QUERY_INTERVAL_MS: u64 = 1000;
 
 /// Takes care of synchronising client with master.
 /// Polling commands & pushing outputs.
@@ -620,6 +679,7 @@ impl Drop for ClientSyncHandle {
 
 impl Drop for ServingClient {
     fn drop(&mut self) {
+        self.reset_handle.abort();
     }
 }
 
@@ -790,19 +850,70 @@ impl ServingClient {
                             }
                         }
                     }
+                    Err(TryRecvError::Empty) => {
+                        continue;
+                    }
                     Err(e) => {
-                        eprintln!("Error reading from command buffer thread: {e}");
+                        eprintln!("Error whilst reading from command buffer: {e}");
                         eprintln!("Recv thread has been aborted.");
+                        eprintln!(
+                            "Note: this action is not performed automatically, but it may be in the future."
+                        );
+                        {
+                            master.write().await.push(PushRequest {
+                                token: token.clone(),
+                                out: vec![
+                                    HistoryLn::new_stderr(format!("Error whilst reading from command buffer: {e}")),
+                                    HistoryLn::new_stderr("The RECV thread has been aborted. A reset is necessary to recover the client.".to_string()),
+                                    HistoryLn::new_stderr("Note: this action is not performed automatically, but it may be in the future.".to_string()),
+                                ]
+                            }).await;
+                        }
                         break;
                     }
                 }
             }
         }));
+        println!("Finished initialising working threads.");
     }
 
-    pub fn kill_recv(&self) {
-        if let Some(recv) = &self.recv_thread {
-            recv.abort();
+    pub async fn handle_reset(&mut self) {
+        let interval = Duration::from_millis(RESET_QUERY_INTERVAL_MS);
+        loop {
+            sleep_until(Instant::now() + interval).await;
+            let reset = {
+                let mut guard = self.must_reset.lock().unwrap();
+                let value = *guard;
+                *guard = false;
+                value
+            };
+            if reset && self.reset().await {
+                self.run_recv().await;
+            }
         }
+    }
+
+    /// # Return
+    /// `true` if threads were running before reset
+    pub async fn reset(&mut self) -> bool {
+        let was_running = self.handle.cmd_rx.is_none();
+        self.handle =
+            Self::init_sync_thread(self.master.clone(), self.token.clone(), self.interval);
+        eprintln!("[!] Requested synchronisation handle(s) reset [was_running={was_running}]");
+        let _ = self.handle.out_tx.send(vec![HistoryLn::new_stdout(format!(
+            "[!] Requested synchronisation handle(s) reset [was_running={was_running}]"
+        ))]);
+        if was_running {
+            println!("[!] Restoring session...");
+            let _ = self.handle.out_tx.send(vec![HistoryLn::new_stdout(
+                "[!] Restoring session...".to_string(),
+            )]);
+        } else {
+            println!("Synchronisation handle(s) restored.");
+            let _ = self.handle.out_tx.send(vec![HistoryLn::new_stdout(
+                "Synchronisation handle(s) restored.".to_string(),
+            )]);
+        }
+        was_running
     }
 }

@@ -14,6 +14,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let stdout = stdout();
         let mut lock = stdout.lock();
+        writeln!(lock)?;
         writeln!(
             lock,
             "Centralised Remote Shell - tiny remote shell execution protocol"
@@ -120,6 +121,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             );
                         }
                     }
+                    "reset" => {
+                        if let Some(endpoint) = &endpoint {
+                            let args: Vec<&str> = input.split_whitespace().skip(1).collect();
+                            if !args.is_empty() {
+                                let token = args[0];
+                                reset(endpoint, token).await;
+                            } else {
+                                eprintln!("You must provide a token.")
+                            }
+                        } else {
+                            eprintln!(
+                                "You are currently not bound to any session, use 'bind' to connect to one."
+                            )
+                        }
+                    }
                     "quit" => break,
                     _ => print_help()?,
                 }
@@ -135,6 +151,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+async fn reset(endpoint: &MasterEndpoint, token: &str) {
+    match endpoint.reset(token).await {
+        Ok(()) => println!("Sent reset request to {token}"),
+        Err(e) => eprintln!("Failed to send reset request to {token}: {e}"),
+    }
 }
 
 const DEFAULT_QUERY_COUNT: usize = 10;
@@ -208,6 +231,7 @@ async fn conn_endpoint(remote: Remote) -> Option<MasterEndpoint> {
 fn print_help() -> Result<(), Box<dyn Error>> {
     let stdout = stdout();
     let mut lock = stdout.lock();
+    writeln!(lock)?;
     writeln!(
         lock,
         "Centralised Remote Shell - tiny remote shell execution protocol"
@@ -233,6 +257,9 @@ fn print_help() -> Result<(), Box<dyn Error>> {
     writeln!(lock)?;
     writeln!(lock, "   query Query CRSH router out + err history")?;
     writeln!(lock, "   [-N {DEFAULT_QUERY_COUNT} [1,340]] [ADDRESS:PORT]")?;
+    writeln!(lock)?;
+    writeln!(lock, "   reset Reset a specific agent in case it blocked")?;
+    writeln!(lock, "   TOKEN")?;
 
     writeln!(lock)?;
     writeln!(lock, "MISCELLANEOUS")?;

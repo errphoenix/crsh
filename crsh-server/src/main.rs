@@ -92,6 +92,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     {
         let stdout = stdout();
         let mut lock = stdout.lock();
+        writeln!(lock)?;
         writeln!(
             lock,
             "Centralised Remote Shell - tiny remote shell execution protocol"
@@ -107,6 +108,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let app = Router::new()
         .route("/", get(root))
         .route(crsh_core::ROUTER_AUTH, post(hello))
+        .route(crsh_core::ROUTER_ASK_RESET, get(must_reset))
+        .route(crsh_core::ROUTER_SET_RESET, post(reset))
         .route(crsh_core::ROUTER_POLL, post(poll))
         .route(crsh_core::ROUTER_SUBMIT, post(submit))
         .route(crsh_core::ROUTER_OUT, post(push_out))
@@ -163,6 +166,28 @@ async fn hello(
             token: id.to_string(),
         }),
     )
+}
+
+async fn must_reset(
+    State(state): State<Arc<Mutex<StateHandler>>>,
+    Json(payload): Json<PollRequest>,
+) -> String {
+    let mut guard = state.lock().unwrap();
+    guard.router.must_reset(&payload.token).to_string()
+}
+
+async fn reset(
+    State(state): State<Arc<Mutex<StateHandler>>>,
+    Json(payload): Json<PollRequest>,
+) -> StatusCode {
+    let mut guard = state.lock().unwrap();
+    let token = payload.token;
+    if !guard.router.is_valid(&token) {
+        return StatusCode::NO_CONTENT;
+    }
+    println!("Requested reset for {}", token);
+    guard.router.set_reset(token);
+    StatusCode::OK
 }
 
 async fn poll(

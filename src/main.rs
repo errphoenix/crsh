@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::fs::write("token", token.to_string())?;
     }
     let mut client = ServingClient::new(master, token.to_string(), interval, name);
-    client.run_recv();
-    client.recv_handle().as_mut().unwrap().await?;
+    client.run_recv().await;
+    client.handle_reset().await;
     Ok(())
 }
