@@ -13,6 +13,7 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -821,34 +822,40 @@ impl ServingClient {
                 sleep_until(Instant::now() + interval).await;
                 match rx.try_recv() {
                     Ok(msg) => {
-                        let mut w: Vec<&str> = msg.0.split_whitespace().collect();
-                        let out = std::process::Command::new(w[0])
-                            .args(w.drain(1..))
-                            .output()
-                            .map_err(|e| {
-                                let _ = out_tx.send(vec![
-                                    HistoryLn::new_stderr(format!("Failed to run command: {msg}")),
-                                    HistoryLn::new_stderr(format!("{e}")),
-                                ]);
-                                eprintln!("Failed to run command: {msg}");
-                                eprintln!("{e}")
-                            });
-                        if let Ok(out) = out {
-                            if let Ok(out) = String::from_utf8(out.stdout) {
-                                let _ = out_tx.send(
-                                    out.lines()
-                                        .map(|s| HistoryLn::new_stdout(s.to_string()))
-                                        .collect(),
-                                );
+                        let mut w: Vec<String> =
+                            msg.0.split_whitespace().map(|s| s.to_string()).collect();
+                        let out_tx = out_tx.clone();
+                        thread::spawn(move || {
+                            let out = std::process::Command::new(w[0].clone())
+                                .args(w.drain(1..))
+                                .output()
+                                .map_err(|e| {
+                                    let _ = out_tx.send(vec![
+                                        HistoryLn::new_stderr(format!(
+                                            "Failed to run command: {msg}"
+                                        )),
+                                        HistoryLn::new_stderr(format!("{e}")),
+                                    ]);
+                                    eprintln!("Failed to run command: {msg}");
+                                    eprintln!("{e}")
+                                });
+                            if let Ok(out) = out {
+                                if let Ok(out) = String::from_utf8(out.stdout) {
+                                    let _ = out_tx.send(
+                                        out.lines()
+                                            .map(|s| HistoryLn::new_stdout(s.to_string()))
+                                            .collect(),
+                                    );
+                                }
+                                if let Ok(err) = String::from_utf8(out.stderr) {
+                                    let _ = out_tx.send(
+                                        err.lines()
+                                            .map(|s| HistoryLn::new_stderr(s.to_string()))
+                                            .collect(),
+                                    );
+                                }
                             }
-                            if let Ok(err) = String::from_utf8(out.stderr) {
-                                let _ = out_tx.send(
-                                    err.lines()
-                                        .map(|s| HistoryLn::new_stderr(s.to_string()))
-                                        .collect(),
-                                );
-                            }
-                        }
+                        });
                     }
                     Err(TryRecvError::Empty) => {
                         continue;
