@@ -199,7 +199,7 @@ async fn submit(endpoint: &MasterEndpoint, target: Option<String>, mut args: Vec
                 cmd_str.push_str(s);
                 cmd_str.push(' ');
             });
-            Command(cmd_str)
+            Command::Cmd(cmd_str)
         };
 
         let req = if let Some(token) = target {

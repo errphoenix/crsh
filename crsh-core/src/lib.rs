@@ -6,15 +6,17 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
+use std::fs::File;
+use std::io::Write;
 use std::marker::PhantomData;
 use std::num::ParseIntError;
-use std::ops::Deref;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
 use std::time::Duration;
+use std::{fs, thread};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
@@ -132,6 +134,9 @@ pub const ROUTER_POLL: &str = "/poll";
 pub const ROUTER_SET_RESET: &str = "/reset";
 pub const ROUTER_ASK_RESET: &str = "/amiok";
 pub const ROUTER_OUT: &str = "/out";
+pub const ROUTER_FS_READ: &str = "/fs/read";
+pub const ROUTER_FS_SYNC: &str = "/fs/sync";
+pub const ROUTER_FS_EST: &str = "/fs/est";
 pub const ROUTER_QUERY_OUT: &str = "/outq";
 pub const ROUTER_SUBMIT: &str = "/cmd";
 
@@ -178,6 +183,18 @@ impl Remote {
 
     fn as_out_url(&self) -> String {
         format!("{self}{}", ROUTER_OUT)
+    }
+
+    fn as_fs_read_url(&self) -> String {
+        format!("{self}{}", ROUTER_FS_READ)
+    }
+
+    fn as_fs_sync_url(&self) -> String {
+        format!("{self}{}", ROUTER_FS_SYNC)
+    }
+
+    fn as_fs_est_url(&self) -> String {
+        format!("{self}{}", ROUTER_FS_EST)
     }
 
     fn as_out_query_url(&self) -> String {
@@ -255,8 +272,41 @@ impl Display for OutType {
     }
 }
 
+#[derive(Debug)]
+pub struct FsBridge {
+    pub path: String,
+    pub file_list: Vec<FileInfo>,
+    pub(crate) selected_file_contents: HashMap<String, String>,
+}
+
+impl Default for FsBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FsBridge {
+    pub fn new() -> Self {
+        Self {
+            path: String::new(),
+            file_list: Vec::new(),
+            selected_file_contents: HashMap::new(),
+        }
+    }
+
+    fn establish(&mut self, bridge_id: String) {
+        println!("Established Filesystem Bridge on {bridge_id}");
+        self.selected_file_contents.insert(bridge_id, String::new());
+    }
+
+    pub fn get_file_contents(&self, bridge_id: &str) -> Option<String> {
+        self.selected_file_contents.get(bridge_id).cloned()
+    }
+}
+
 pub struct MasterRouter {
     history: VecDeque<HistoryLn>,
+    fs_bridges: HashMap<String, FsBridge>,
     queue: HashMap<String, Arc<Mutex<Vec<Command>>>>,
     reset: HashSet<String>,
 }
@@ -268,6 +318,7 @@ impl MasterRouter {
         (
             Self {
                 history: VecDeque::with_capacity(HISTORY_LENGTH),
+                fs_bridges: HashMap::new(),
                 queue: HashMap::new(),
                 reset: HashSet::new(),
             },
@@ -283,6 +334,39 @@ impl MasterRouter {
         self.reset.remove(token)
     }
 
+    //todo
+    // dont use request struct
+    // make a struct for sync info
+    // pass token as string slice
+    pub fn synchronize_fs(&mut self, req: FsSyncRequest) {
+        let token = req.token;
+        let bridge = self.fs_bridges.entry(token).or_default();
+        bridge.path = req.path;
+        bridge.file_list = req.dir_info;
+        req.display_map.iter().for_each(|(k, v)| {
+            if let Some(b) = bridge.selected_file_contents.get_mut(k) {
+                *b = v.clone();
+            }
+        });
+    }
+
+    pub fn establish_fs_bridge(&mut self, with: &str) -> Option<String> {
+        if !self.queue.contains_key(with) {
+            eprintln!("Attempted to establish Filesystem bridge with non-existing agent: {with}");
+            return None;
+        }
+        if let Some(bridge) = self.fs_bridges.get_mut(with) {
+            let bridge_id = Uuid::new_v4().to_string();
+            bridge.establish(bridge_id.clone());
+            return Some(bridge_id);
+        }
+        None
+    }
+
+    pub fn query_fs_bridge(&self, token: &str) -> Option<&FsBridge> {
+        self.fs_bridges.get(token)
+    }
+
     pub fn register_all(&mut self, tokens: &[String]) {
         if tokens.is_empty() {
             return;
@@ -291,6 +375,7 @@ impl MasterRouter {
             self.queue
                 .entry(token.clone())
                 .or_insert_with(|| Arc::new(Mutex::new(Vec::with_capacity(COMMAND_BUFFER_ALLOC))));
+            self.fs_bridges.insert(token.clone(), FsBridge::new());
         }
         println!("Registered {} tokens from storage.", tokens.len());
     }
@@ -372,6 +457,8 @@ impl Display for MasterEndpoint {
 pub enum EndpointError {
     ConnFailure { e: ConnectError },
     SubmitFailure(String),
+    FsEstFailure(String),
+    FsReadFailure(String),
     QueryFailure(String),
     ResetFailure(String),
 }
@@ -387,6 +474,8 @@ impl Display for EndpointError {
         match self {
             EndpointError::ConnFailure { e } => write!(f, "{e}"),
             EndpointError::SubmitFailure(r) => write!(f, "submit failure: {r}"),
+            EndpointError::FsEstFailure(r) => write!(f, "filesystem bridge est. failure: {r}"),
+            EndpointError::FsReadFailure(r) => write!(f, "filesystem read failure: {r}"),
             EndpointError::QueryFailure(r) => write!(f, "query: failure: {r}"),
             EndpointError::ResetFailure(r) => write!(f, "reset failure: {r}"),
         }
@@ -404,7 +493,6 @@ impl MasterEndpoint {
     }
 
     pub async fn submit(&self, request: SubmitRequest) -> Result<(), EndpointError> {
-        self.0.ping().await?;
         if let Err(e) = self
             .1
             .post(self.0.as_submit_url())
@@ -418,8 +506,38 @@ impl MasterEndpoint {
         }
     }
 
+    pub async fn est_bridge_fs(&self, token: &str) -> Result<FsEstResult, EndpointError> {
+        let req = FsEstRequest {
+            token: token.to_string(),
+        };
+        match self.1.post(self.0.as_fs_est_url()).json(&req).send().await {
+            Ok(id) => id
+                .json::<FsEstResult>()
+                .await
+                .map_err(|e| EndpointError::FsEstFailure(e.to_string())),
+            Err(e) => Err(EndpointError::FsEstFailure(e.to_string())),
+        }
+    }
+
+    pub async fn query_filesystem(
+        &self,
+        token: &str,
+        bridge: &str,
+    ) -> Result<FileSystemView, EndpointError> {
+        let req = FsReadRequest {
+            token: token.to_string(),
+            bridge: bridge.to_string(),
+        };
+        match self.1.get(self.0.as_fs_read_url()).json(&req).send().await {
+            Ok(fs) => {
+                let fs = fs.json::<FileSystemView>().await;
+                fs.map_err(|e| EndpointError::FsReadFailure(e.to_string()))
+            }
+            Err(e) => Err(EndpointError::FsReadFailure(e.to_string())),
+        }
+    }
+
     pub async fn query(&self) -> Result<HistoryQuery, EndpointError> {
-        self.0.ping().await?;
         match self.1.get(self.0.as_out_query_url()).send().await {
             Ok(res) => Ok(res
                 .json::<HistoryQuery>()
@@ -430,7 +548,6 @@ impl MasterEndpoint {
     }
 
     pub async fn reset(&self, token: &str) -> Result<(), EndpointError> {
-        self.0.ping().await?;
         let req = PollRequest {
             token: token.to_string(),
         };
@@ -497,7 +614,7 @@ impl Agent<PreConnect> {
                         eprintln!("Failed to ping remote {}", self.remote);
                         eprintln!("{e}");
                         println!("Retrying in {} seconds...", RETRY_INTERVAL.as_secs());
-                        sleep_until(tokio::time::Instant::now() + RETRY_INTERVAL).await;
+                        sleep_until(Instant::now() + RETRY_INTERVAL).await;
                     }
                 }
             }
@@ -565,6 +682,15 @@ impl Agent<PreConnect> {
 }
 
 impl Agent<Connected> {
+    pub async fn sync_bridge(&self, request: FsSyncRequest) {
+        let client = self.client.as_ref().unwrap();
+        let _ = client
+            .post::<String>(self.remote.as_fs_sync_url())
+            .json(&request)
+            .send()
+            .await;
+    }
+
     pub async fn needs_reset(&self, request: PollRequest) -> bool {
         let client = self.client.as_ref().unwrap();
         let resp_body = client
@@ -617,34 +743,277 @@ impl Agent<Connected> {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Command(pub String);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "inner")]
+pub enum Command {
+    Cmd(String),
+    Io(IoCommand),
+}
 
-impl Deref for Command {
-    type Target = String;
+#[test]
+fn cmd_serde() {
+    let a = Command::Cmd("test".to_string());
+    println!("{}", serde_json::to_string(&a).unwrap());
+    println!("{a:?}");
+    println!("{a}");
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    println!();
+
+    let b = Command::Io(IoCommand::Create {
+        dir: false,
+        path: "C:/test/hi.txt".to_string(),
+    });
+    println!("{}", serde_json::to_string(&b).unwrap());
+    println!("{b:?}");
+    println!("{b}");
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum IoCommand {
+    Create { dir: bool, path: String },
+    Delete { dir: bool, path: String },
+
+    Display { path: String, bridge: String },
+
+    Write { path: String, contents: String },
+    Append { path: String, contents: String },
+
+    ListDir { path: String },
+}
+
+impl Display for IoCommand {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IoCommand::Create { dir, path } => {
+                let ft = if *dir { "directory" } else { "file" };
+                write!(f, "create {ft} {path}")
+            }
+            IoCommand::Delete { dir, path } => {
+                let ft = if *dir { "directory" } else { "file" };
+                write!(f, "delete {ft} {path}")
+            }
+            IoCommand::Display { path, .. } => write!(f, "display file {path}"),
+            IoCommand::Write { path, .. } => write!(f, "write to file {path}"),
+            IoCommand::Append { path, .. } => write!(f, "create file {path}"),
+            IoCommand::ListDir { path } => write!(f, "list directory {path}"),
+        }
     }
 }
 
 impl Display for Command {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            Command::Cmd(cmd) => write!(f, "{cmd}"),
+            Command::Io(io_cmd) => write!(f, "[I/O] {io_cmd}"),
+        }
     }
 }
 
 impl FromStr for Command {
     type Err = ();
 
+    /// Always constructs a Command::Cmd
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
+        Ok(Command::Cmd(s.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileInfo {
+    pub name: String,
+    pub size: u64,
+}
+
+impl Display for FileInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} - {} bytes", self.name, self.size)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientFilesystem {
+    /// Path of working directory
+    current_path: PathBuf,
+    /// File info of the current working directory
+    directory_info: Vec<FileInfo>,
+    // dirty
+    flag: bool,
+}
+
+impl Default for ClientFilesystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClientFilesystem {
+    pub fn new() -> Self {
+        Self {
+            current_path: PathBuf::new(),
+            directory_info: vec![],
+            flag: true,
+        }
+    }
+
+    pub fn flag(&self) -> bool {
+        self.flag
+    }
+
+    fn set_flag(&mut self) {
+        self.flag = true
+    }
+
+    fn reset_flag(&mut self) {
+        self.flag = false
+    }
+
+    pub fn create_file(&mut self, path: &str) -> Result<(), String> {
+        let path = self.current_path.join(path);
+        match File::create_new(&path) {
+            Ok(_) => {
+                println!("[I/O] Create file: {path:?}");
+                self.set_flag();
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[I/O] Failed to create file: {e}");
+                Err(format!("[I/O] Failed to create file: {e}"))
+            }
+        }
+    }
+
+    pub fn create_dir(&mut self, path: &str) -> Result<(), String> {
+        let path = self.current_path.join(path);
+        match fs::create_dir_all(&path) {
+            Ok(_) => {
+                println!("[I/O] Create directory: {path:?}");
+                self.set_flag();
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[I/O] Failed to create directory: {e}");
+                Err(format!("[I/O] Failed to create directory: {e}"))
+            }
+        }
+    }
+
+    pub fn delete_file(&mut self, path: &str) -> Result<(), String> {
+        let path = self.current_path.join(path);
+        match fs::remove_file(&path) {
+            Ok(_) => {
+                println!("[I/O] Delete file: {path:?}");
+                self.set_flag();
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[I/O] Failed to delete file: {e}");
+                Err(format!("[I/O] Failed to delete file: {e}"))
+            }
+        }
+    }
+
+    pub fn delete_dir(&mut self, path: &str) -> Result<(), String> {
+        let path = self.current_path.join(path);
+        match fs::remove_dir_all(&path) {
+            Ok(_) => {
+                println!("[I/O] Delete directory: {path:?}");
+                self.set_flag();
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[I/O] Failed to delete directory: {e}");
+                Err(format!("[I/O] Failed to delete directory: {e}"))
+            }
+        }
+    }
+
+    pub fn read_file_contents(&self, file: &str) -> Result<String, String> {
+        let path = self.current_path.join(file);
+        match fs::read_to_string(path) {
+            Ok(contents) => Ok(contents),
+            Err(e) => {
+                eprintln!("Error reading contents of current file: {e}");
+                Err(format!("Error reading contents of current file: {e}"))
+            }
+        }
+    }
+
+    pub fn load_dir_contents(&mut self) -> Result<(), String> {
+        match fs::read_dir(&self.current_path) {
+            Ok(read) => {
+                self.set_flag();
+                self.directory_info.clear();
+                read.for_each(|entry| {
+                    let fi = match entry {
+                        Ok(entry) => match entry.metadata() {
+                            Ok(meta) => FileInfo {
+                                name: entry.file_name().to_string_lossy().to_string(),
+                                size: meta.len(),
+                            },
+                            Err(e) => {
+                                eprintln!("Failed to read directory entry metadata: {e}");
+                                FileInfo {
+                                    name: "Error ???".to_string(),
+                                    size: 67,
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Failed to read directory entry: {e}");
+                            FileInfo {
+                                name: "Error ???".to_string(),
+                                size: 67,
+                            }
+                        }
+                    };
+                    self.directory_info.push(fi);
+                });
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Error reading directory: {e}");
+                Err(format!("Error reading directory: {e}"))
+            }
+        }
+    }
+
+    pub fn write_to_file(&self, file: &str, contents: &[u8], append: bool) -> Result<(), String> {
+        let path = self.current_path.join(file);
+        if append {
+            match fs::OpenOptions::new()
+                .truncate(false)
+                .append(true)
+                .open(&path)
+            {
+                Ok(mut file) => file.write_all(contents),
+                Err(e) => Err(e),
+            }
+        } else {
+            fs::write(&path, contents)
+        }
+        .map_err(|e| {
+            eprintln!("Error writing contents to file: {e}");
+            format!("Error writing contents to file: {e}")
+        })
+    }
+
+    pub fn set_path(&mut self, path: &str) {
+        let path = fs::canonicalize(path).unwrap_or(PathBuf::from(path));
+        if !self.current_path.eq(&path) && path.exists() {
+            self.set_flag();
+            self.current_path = path;
+            self.directory_info.clear();
+        }
     }
 }
 
 pub struct ServingClient {
     pub interval: Duration,
     pub name: &'static str,
+
+    filesystem: Arc<tokio::sync::Mutex<ClientFilesystem>>,
+    fs_sync_queue: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 
     master: Arc<RwLock<Agent<Connected>>>,
     token: String,
@@ -709,9 +1078,7 @@ impl ServingClient {
                         .await
                     {
                         PollResult::Success { queue } => {
-                            queue
-                                .iter()
-                                .for_each(|c| cmd_tx.send(Command::from_str(c).unwrap()).unwrap());
+                            queue.iter().for_each(|c| cmd_tx.send(c.clone()).unwrap());
                         }
                         PollResult::Failure { reason } => {
                             let _ = out_tx.send(vec![HistoryLn::new_stderr(format!(
@@ -788,6 +1155,10 @@ impl ServingClient {
         Self {
             interval,
             name,
+
+            filesystem: Arc::new(tokio::sync::Mutex::new(ClientFilesystem::new())),
+            fs_sync_queue: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+
             master,
             token,
 
@@ -805,6 +1176,96 @@ impl ServingClient {
         &mut self.handle.sync_thread
     }
 
+    /// # Note
+    /// Command::Cmd is run in an async thread, while Command::Io operations are all run onto the current thread
+    async fn execute_command(
+        command: Command,
+        tx: Sender<Vec<HistoryLn>>,
+        fs_sync_queue: &mut HashMap<String, String>,
+        filesystem: &mut ClientFilesystem,
+    ) {
+        match &command {
+            Command::Cmd(msg) => {
+                let wd = filesystem.current_path.clone();
+                let mut w: Vec<String> = msg.split_whitespace().map(|s| s.to_string()).collect();
+                thread::spawn(move || {
+                    let out = std::process::Command::new(w[0].clone())
+                        .args(w.drain(1..))
+                        .current_dir(wd)
+                        .output()
+                        .map_err(|e| {
+                            let _ = tx.send(vec![
+                                HistoryLn::new_stderr(format!("Failed to run command: {command}")),
+                                HistoryLn::new_stderr(format!("{e}")),
+                            ]);
+                            eprintln!("Failed to run command: {command}");
+                            eprintln!("{e}")
+                        });
+                    if let Ok(out) = out {
+                        if let Ok(out) = String::from_utf8(out.stdout) {
+                            let _ = tx.send(
+                                out.lines()
+                                    .map(|s| HistoryLn::new_stdout(s.to_string()))
+                                    .collect(),
+                            );
+                        }
+                        if let Ok(err) = String::from_utf8(out.stderr) {
+                            let _ = tx.send(
+                                err.lines()
+                                    .map(|s| HistoryLn::new_stderr(s.to_string()))
+                                    .collect(),
+                            );
+                        }
+                    }
+                });
+            }
+            Command::Io(io_command) => {
+                if let Err(e) = Self::execute_command_io(io_command, fs_sync_queue, filesystem) {
+                    let _ = tx.send(vec![HistoryLn::new_stderr(format!(
+                        "[I/O] Client-side IO error: {e}"
+                    ))]);
+                }
+            }
+        }
+    }
+
+    /// [`IoCommand::ListDir`] also sets the client working directory with [`ClientFilesystem::set_path`]
+    fn execute_command_io(
+        command: &IoCommand,
+        sync_queue: &mut HashMap<String, String>,
+        filesystem: &mut ClientFilesystem,
+    ) -> Result<(), String> {
+        match command {
+            IoCommand::Create { dir, path } => {
+                if *dir {
+                    filesystem.create_dir(path)
+                } else {
+                    filesystem.create_file(path)
+                }
+            }
+            IoCommand::Delete { dir, path } => {
+                if *dir {
+                    filesystem.delete_dir(path)
+                } else {
+                    filesystem.delete_file(path)
+                }
+            }
+            IoCommand::Display { path, bridge } => filesystem.read_file_contents(path).map(|str| {
+                sync_queue.insert(bridge.clone(), str);
+            }),
+            IoCommand::Write { path, contents } => {
+                filesystem.write_to_file(path, contents.as_bytes(), false)
+            }
+            IoCommand::Append { path, contents } => {
+                filesystem.write_to_file(path, contents.as_bytes(), true)
+            }
+            IoCommand::ListDir { path } => {
+                filesystem.set_path(path);
+                filesystem.load_dir_contents()
+            }
+        }
+    }
+
     pub async fn run_recv(&mut self) {
         let rx = self.handle.cmd_rx.take();
         if rx.is_none() {
@@ -812,50 +1273,47 @@ impl ServingClient {
             self.reset().await;
         }
         let rx = rx.unwrap();
+
+        let filesystem = self.filesystem.clone();
+        let fs_sync_queue = self.fs_sync_queue.clone();
         let out_tx = self.handle.out_tx.clone();
         let master = self.master.clone();
         let token = self.token.clone();
         let interval = self.interval;
+
         println!("Initialising recv thread...");
+
         self.handle.recv_thread = Some(tokio::spawn(async move {
             loop {
                 sleep_until(Instant::now() + interval).await;
                 match rx.try_recv() {
-                    Ok(msg) => {
-                        let mut w: Vec<String> =
-                            msg.0.split_whitespace().map(|s| s.to_string()).collect();
-                        let out_tx = out_tx.clone();
-                        thread::spawn(move || {
-                            let out = std::process::Command::new(w[0].clone())
-                                .args(w.drain(1..))
-                                .output()
-                                .map_err(|e| {
-                                    let _ = out_tx.send(vec![
-                                        HistoryLn::new_stderr(format!(
-                                            "Failed to run command: {msg}"
-                                        )),
-                                        HistoryLn::new_stderr(format!("{e}")),
-                                    ]);
-                                    eprintln!("Failed to run command: {msg}");
-                                    eprintln!("{e}")
-                                });
-                            if let Ok(out) = out {
-                                if let Ok(out) = String::from_utf8(out.stdout) {
-                                    let _ = out_tx.send(
-                                        out.lines()
-                                            .map(|s| HistoryLn::new_stdout(s.to_string()))
-                                            .collect(),
-                                    );
-                                }
-                                if let Ok(err) = String::from_utf8(out.stderr) {
-                                    let _ = out_tx.send(
-                                        err.lines()
-                                            .map(|s| HistoryLn::new_stderr(s.to_string()))
-                                            .collect(),
-                                    );
-                                }
-                            }
-                        });
+                    Ok(command) => {
+                        Self::execute_command(
+                            command,
+                            out_tx.clone(),
+                            &mut *fs_sync_queue.lock().await,
+                            &mut *filesystem.lock().await,
+                        )
+                        .await;
+
+                        let mut filesystem_lock = filesystem.lock().await;
+                        let mut fs_sync_lock = fs_sync_queue.lock().await;
+                        if !fs_sync_lock.is_empty() || filesystem_lock.flag() {
+                            filesystem_lock.reset_flag();
+                            master
+                                .write()
+                                .await
+                                .sync_bridge(FsSyncRequest {
+                                    token: token.clone(),
+                                    path: filesystem_lock
+                                        .current_path
+                                        .to_string_lossy()
+                                        .to_string(),
+                                    dir_info: filesystem_lock.directory_info.clone(),
+                                    display_map: fs_sync_lock.drain().collect(),
+                                })
+                                .await;
+                        }
                     }
                     Err(TryRecvError::Empty) => {
                         continue;
@@ -868,12 +1326,12 @@ impl ServingClient {
                         );
                         {
                             master.write().await.push(PushRequest {
-                                token: token.clone(),
+                                token,
                                 out: vec![
                                     HistoryLn::new_stderr(format!("Error whilst reading from command buffer: {e}")),
                                     HistoryLn::new_stderr("The RECV thread has been aborted. A reset is necessary to recover the client.".to_string()),
                                     HistoryLn::new_stderr("Note: this action is not performed automatically, but it may be in the future.".to_string()),
-                                ]
+                                ],
                             }).await;
                         }
                         break;

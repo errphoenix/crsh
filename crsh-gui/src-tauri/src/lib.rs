@@ -1,7 +1,43 @@
-use crsh_core::{Command, HistoryLn, MasterEndpoint, Remote, SubmitRequest};
+use crsh_core::{
+    Command, FileSystemView, FsEstResult, HistoryLn, MasterEndpoint, Remote, SubmitRequest,
+};
 use std::str::FromStr;
 use tauri::async_runtime::Mutex;
 use tauri::State;
+
+#[tauri::command]
+async fn fs_est(state: State<'_, Mutex<AppState>>, token: &str) -> Result<String, String> {
+    let state = state.lock().await;
+    if let Some(master) = &state.remote {
+        match master.est_bridge_fs(token).await {
+            Ok(r) => match r {
+                FsEstResult::Allowed { id } => Ok(id),
+                FsEstResult::NotFound => Err("Failed to connect to filesystem".to_string()),
+                FsEstResult::Denied => Err("Access to the filesystem is not allowed".to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        }
+    } else {
+        Err("You have not bound an endpoint.".to_string())
+    }
+}
+
+#[tauri::command]
+async fn fs_read(
+    state: State<'_, Mutex<AppState>>,
+    token: &str,
+    bridge: &str,
+) -> Result<FileSystemView, String> {
+    let state = state.lock().await;
+    if let Some(master) = &state.remote {
+        master
+            .query_filesystem(token, bridge)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Err("You have not bound an endpoint.".to_string())
+    }
+}
 
 /// Just stores remote and keeps it on record. Trusts front-end on assuming it is a valid one.
 #[tauri::command]
@@ -22,19 +58,17 @@ async fn set_remote(state: State<'_, Mutex<AppState>>, remote: &str) -> Result<(
 async fn submit(
     state: State<'_, Mutex<AppState>>,
     broadcast: bool,
-    cmd: &str,
+    cmd: Command,
     token: Option<&str>,
 ) -> Result<(), String> {
     let state = state.lock().await;
     if let Some(master) = &state.remote {
         let req = if broadcast || token.is_none() {
-            SubmitRequest::Broadcast {
-                cmd: Command(cmd.to_string()),
-            }
+            SubmitRequest::Broadcast { cmd }
         } else {
             SubmitRequest::Single {
                 token: token.unwrap().to_string(),
-                cmd: Command(cmd.to_string()),
+                cmd,
             }
         };
         master.submit(req).await.map_err(|e| e.to_string())
@@ -81,7 +115,9 @@ pub(crate) struct AppState {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![set_remote, submit, reset, query])
+        .invoke_handler(tauri::generate_handler![
+            set_remote, submit, reset, query, fs_read, fs_est
+        ])
         .manage(Mutex::new(AppState::default()))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

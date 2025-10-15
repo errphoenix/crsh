@@ -1,6 +1,6 @@
 [package]
 name = "crsh-gui"
-version = "0.1.0"
+version = "0.2.0"
 description = "GUI client for CRSH"
 authors = ["HerrPhoenix"]
 edition = "2021"

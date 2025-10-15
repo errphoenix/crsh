@@ -1,5 +1,6 @@
-use crate::{Command, HistoryLn};
+use crate::{Command, FileInfo, HistoryLn};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,4 +64,43 @@ pub struct HistoryQuery(pub Vec<HistoryLn>);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResetRequest {
     pub token: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FsEstRequest {
+    pub token: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "result")]
+pub enum FsEstResult {
+    Allowed { id: String },
+    NotFound,
+    Denied,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FsReadRequest {
+    pub token: String,
+    pub bridge: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FsSyncRequest {
+    pub token: String,
+    pub path: String,
+    pub dir_info: Vec<FileInfo>,
+    pub display_map: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FsState {
+    pub file_contents: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileSystemView {
+    pub path: String,
+    pub dir_info: Vec<FileInfo>,
+    pub display: String,
 }

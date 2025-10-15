@@ -67,7 +67,7 @@ fn arg_var(arg: &str) -> Option<String> {
     }
 }
 
-const VER_STR: &str = "v0.1.0-agent";
+const VER_STR: &str = "v0.2.0-agent";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

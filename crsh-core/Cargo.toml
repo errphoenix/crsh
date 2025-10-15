@@ -1,6 +1,6 @@
 [package]
 name = "crsh-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -11,3 +11,4 @@ uuid = { version = "1.18.1", features = ["v4"] }
 tokio = "1.47.1"
 rand = "0.10.0-rc.0"
 serde = "1.0.228"
+serde_json = "1.0.145"

@@ -57,3 +57,24 @@ export type HistLn = {
     message: string,
     stdtype: string
 }
+
+export type Command = {
+    type: string,
+    inner: string | IoCommand,
+}
+
+/**
+ * Create  { dir: bool, path: String },
+ * Delete  { dir: bool, path: String },
+ * Display { path: String, bridge: String },
+ * Write   { path: String, contents: String },
+ * Append  { path: String, contents: String },
+ * ListDir { path: String },
+ */
+export type IoCommand = {
+    type: string,
+    path: string,
+    dir: boolean | undefined,
+    contents: string | undefined,
+    bridge: string | undefined,
+}

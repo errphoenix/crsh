@@ -3,8 +3,9 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use crsh_core::{
-    AuthRequest, AuthResult, HistoryQuery, MasterRouter, PollRequest, PollResult, PushRequest,
-    SubmitRequest, SubmitResult,
+    AuthRequest, AuthResult, FileSystemView, FsEstRequest, FsEstResult, FsReadRequest,
+    FsSyncRequest, HistoryQuery, MasterRouter, PollRequest, PollResult, PushRequest, SubmitRequest,
+    SubmitResult,
 };
 use std::error::Error;
 use std::fs;
@@ -13,7 +14,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 
-const VER_STR: &str = "v0.1.0-router";
+const VER_STR: &str = "v0.2.0-router";
 
 struct StateHandler {
     key: u16,
@@ -107,12 +108,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cors = CorsLayer::new().allow_origin(Any);
     let app = Router::new()
         .route("/", get(root))
+        // agent routes
         .route(crsh_core::ROUTER_AUTH, post(hello))
         .route(crsh_core::ROUTER_ASK_RESET, get(must_reset))
-        .route(crsh_core::ROUTER_SET_RESET, post(reset))
         .route(crsh_core::ROUTER_POLL, post(poll))
-        .route(crsh_core::ROUTER_SUBMIT, post(submit))
         .route(crsh_core::ROUTER_OUT, post(push_out))
+        .route(crsh_core::ROUTER_FS_SYNC, post(fs_sync))
+        // client routes
+        .route(crsh_core::ROUTER_SET_RESET, post(reset))
+        .route(crsh_core::ROUTER_SUBMIT, post(submit))
+        .route(crsh_core::ROUTER_FS_READ, get(fs_read))
+        .route(crsh_core::ROUTER_FS_EST, post(fs_est))
         .route(crsh_core::ROUTER_QUERY_OUT, get(query_out))
         .with_state(Arc::new(Mutex::new(handler)))
         .layer(cors);
@@ -216,6 +222,57 @@ async fn push_out(State(state): State<Arc<Mutex<StateHandler>>>, Json(payload): 
     let mut guard = state.lock().unwrap();
     if guard.router.is_valid(&payload.token) {
         guard.router.append_history(payload.out)
+    }
+}
+
+async fn fs_read(
+    State(state): State<Arc<Mutex<StateHandler>>>,
+    Json(payload): Json<FsReadRequest>,
+) -> Json<Option<FileSystemView>> {
+    let guard = state.lock().unwrap();
+    Json(
+        if let Some(fs) = guard.router.query_fs_bridge(&payload.token)
+            && let Some(d) = fs.get_file_contents(&payload.bridge)
+        {
+            Some(FileSystemView {
+                path: fs.path.clone(),
+                dir_info: fs.file_list.clone(),
+                display: d,
+            })
+        } else {
+            eprintln!(
+                "Filesystem of {} by bridge {} is not present on server.",
+                payload.token, payload.bridge
+            );
+            None
+        },
+    )
+}
+
+async fn fs_sync(
+    State(state): State<Arc<Mutex<StateHandler>>>,
+    Json(payload): Json<FsSyncRequest>,
+) {
+    let mut guard = state.lock().unwrap();
+    guard.router.synchronize_fs(payload)
+}
+
+async fn fs_est(
+    State(state): State<Arc<Mutex<StateHandler>>>,
+    Json(payload): Json<FsEstRequest>,
+) -> Json<FsEstResult> {
+    let agent = payload.token;
+    let mut guard = state.lock().unwrap();
+    if guard.router.query_fs_bridge(&agent).is_some() {
+        Json(
+            guard
+                .router
+                .establish_fs_bridge(&agent)
+                .map(|id| FsEstResult::Allowed { id })
+                .unwrap_or(FsEstResult::Denied),
+        )
+    } else {
+        Json(FsEstResult::NotFound)
     }
 }
 

@@ -1,7 +1,8 @@
-import {useEffect, useRef, useState} from "react";
-import "./App.css";
+import React, {useEffect, useRef, useState} from "react";
 import {HistLn, parseRemote, Remote} from "./Types.tsx";
 import {invoke} from "@tauri-apps/api/core";
+import Filesystem from "./Filesystem.tsx";
+import "./App.css";
 
 function App() {
     const [remote, setRemote] = useState<Remote | null>();
@@ -93,7 +94,7 @@ function App() {
 
         setSubmitting(true);
         try {
-            await invoke("submit", {broadcast: true, cmd: cmd});
+            await invoke("submit", {broadcast: true, cmd: {type: "Cmd", inner: cmd}});
             setPrompt("");
             formRef.current?.reset();
         } catch (e) {
@@ -201,6 +202,10 @@ function App() {
                                        type="text" placeholder="Token..."
                                        onChange={(e) => setResetTarget(e.target.value)}/>
                             </div>
+                        </div>
+                        <span className="mt-6 bg-slate-700 h-0.5 w-4/5"></span>
+                        <div className="m-auto mt-6 w-4/5">
+                            <Filesystem/>
                         </div>
                     </div>
                 </div>
