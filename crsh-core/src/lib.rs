@@ -1189,18 +1189,20 @@ impl ServingClient {
                 let wd = filesystem.current_path.clone();
                 let mut w: Vec<String> = msg.split_whitespace().map(|s| s.to_string()).collect();
                 thread::spawn(move || {
-                    let out = std::process::Command::new(w[0].clone())
-                        .args(w.drain(1..))
-                        .current_dir(wd)
-                        .output()
-                        .map_err(|e| {
-                            let _ = tx.send(vec![
-                                HistoryLn::new_stderr(format!("Failed to run command: {command}")),
-                                HistoryLn::new_stderr(format!("{e}")),
-                            ]);
-                            eprintln!("Failed to run command: {command}");
-                            eprintln!("{e}")
-                        });
+                    let mut cmd = std::process::Command::new(w[0].clone());
+                    if wd.exists() {
+                        cmd.current_dir(wd);
+                    }
+
+                    cmd.args(w.drain(1..));
+                    let out = cmd.output().map_err(|e| {
+                        let _ = tx.send(vec![
+                            HistoryLn::new_stderr(format!("Failed to run command: {command}")),
+                            HistoryLn::new_stderr(format!("{e}")),
+                        ]);
+                        eprintln!("Failed to run command: {command}");
+                        eprintln!("{e}")
+                    });
                     if let Ok(out) = out {
                         if let Ok(out) = String::from_utf8(out.stdout) {
                             let _ = tx.send(
